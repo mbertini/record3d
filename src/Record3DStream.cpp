@@ -4,6 +4,11 @@
 #include <usbmuxd.h>
 #include <cstring>
 #include <array>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 
 #define NTOHL_(n) (((((unsigned long)(n) & 0xFF)) << 24) | \
                   ((((unsigned long)(n) & 0xFF00)) << 8) | \
@@ -20,7 +25,18 @@ namespace Record3D
 
     Record3DStream::~Record3DStream()
     {
+#ifdef PYTHON_BINDINGS_BUILD
+        // Release the GIL before calling Disconnect() which joins the runloop
+        // thread.  The thread may need the GIL to finish a Python callback.
+        py::gil_scoped_release gilRelease;
+#endif
+        Disconnect();
         delete[] lzfseScratchBuffer_;
+    }
+
+    std::string Record3DStream::GetVersion()
+    {
+        return "1.4.1";
     }
 
     std::vector<DeviceInfo> Record3DStream::GetConnectedDevices()
@@ -63,26 +79,70 @@ namespace Record3D
 
         // We are successfully connected, start runloop.
         connectionEstablished_.store( true );
+        disconnectCleanupDone_.store( false );
         socketHandle_ = socketNo;
 
-        // Create thread that is going to execute runloop.
-        runloopThread_ = std::thread( [&]
+        // Join any previously finished thread before creating a new one.
+        if ( runloopThread_.joinable() )
+        {
+            runloopThread_.join();
+        }
+
+        // Create thread that is going to execute runloop (kept joinable, not detached).
+        runloopThread_ = std::thread( [this]
                                       {
                                           StreamProcessingRunloop();
                                       } );
-        runloopThread_.detach();
         return true;
     }
 
     void Record3DStream::Disconnect()
     {
-        std::lock_guard<std::mutex> guard{ apiCallsMutex_ };
-
+        // Signal the runloop thread to stop.
         connectionEstablished_.store( false );
 
-        if ( onStreamStopped )
+        // Close the socket early to unblock any pending recv() in the runloop
+        // thread.  PerformDisconnectCleanup() checks socketHandle_ >= 0, so
+        // closing here is safe — the cleanup call below will simply skip it.
         {
-            onStreamStopped();
+            std::lock_guard<std::mutex> guard{ apiCallsMutex_ };
+            if ( socketHandle_ >= 0 )
+            {
+                // shutdown() unblocks any thread blocked in recv() on this fd.
+                // close() alone does NOT reliably do this on macOS.
+                shutdown( socketHandle_, SHUT_RDWR );
+                usbmuxd_disconnect( socketHandle_ );
+                socketHandle_ = -1;
+            }
+        }
+
+        // Now the thread's recv() will fail and it will exit, so join is safe.
+        if ( runloopThread_.joinable() )
+        {
+            runloopThread_.join();
+        }
+
+        // Fire the stream-stopped callback exactly once.
+        PerformDisconnectCleanup();
+    }
+
+    void Record3DStream::PerformDisconnectCleanup()
+    {
+        bool expected = false;
+        if ( disconnectCleanupDone_.compare_exchange_strong( expected, true ) )
+        {
+            // Close the USB socket to avoid handle leaks.
+            if ( socketHandle_ >= 0 )
+            {
+                usbmuxd_disconnect( socketHandle_ );
+                socketHandle_ = -1;
+            }
+
+            // Fire the stream-stopped callback exactly once.
+            if ( onStreamStopped )
+            {
+                onStreamStopped();
+            }
         }
     }
 }
@@ -149,69 +209,81 @@ namespace Record3D
             // 3.1 Read the header of Record3D
             currSize = sizeof( Record3DHeader );
             memcpy((void*) &record3DHeader, rawMessageBuffer.data() + offset, currSize );
-            currentDeviceType_ = (DeviceType)record3DHeader.deviceType;
             offset += currSize;
 
-            // 3.2 Read intrinsic matrix coefficients
-            currSize = sizeof( IntrinsicMatrixCoeffs );
-            memcpy((void*) &rgbIntrinsicMatrixCoeffs_, rawMessageBuffer.data() + offset, currSize );
-            offset += currSize;
-
-            // 3.3 Read the camera pose data
-            currSize = sizeof( CameraPose );
-            memcpy( (void*) &cameraPose_, rawMessageBuffer.data() + offset, currSize );
-            offset += currSize;
-
-            // 3.3 Read and decode the RGB frame
-            currSize = record3DHeader.rgbSize;
+            // 3.2 Decode the RGB JPEG into a temporary buffer (expensive, done outside lock).
+            size_t rgbOffset = offset
+                             + sizeof( IntrinsicMatrixCoeffs )
+                             + sizeof( CameraPose );
             int loadedWidth, loadedHeight, loadedChannels;
-            uint8_t* rgbPixels = stbi_load_from_memory( rawMessageBuffer.data() + offset, currSize, &loadedWidth, &loadedHeight, &loadedChannels, STBI_rgb );
-            size_t decompressedRGBDataSize = loadedWidth * loadedHeight * loadedChannels * sizeof(uint8_t);
-            if ( RGBImageBuffer_.size() != decompressedRGBDataSize )
+            uint8_t* rgbPixels = stbi_load_from_memory( rawMessageBuffer.data() + rgbOffset, record3DHeader.rgbSize, &loadedWidth, &loadedHeight, &loadedChannels, STBI_rgb );
+            if ( rgbPixels == nullptr )
             {
-                RGBImageBuffer_.resize(decompressedRGBDataSize);
-            }
-            memcpy( RGBImageBuffer_.data(), rgbPixels, decompressedRGBDataSize);
-            stbi_image_free( rgbPixels );
-            offset += currSize;
-
-            // 3.4 Read and decompress the depth frame
-            currSize = record3DHeader.depthSize;
-            // Resize the decompressed depth image buffer
-            size_t decompressedDepthDataSize = record3DHeader.depthWidth * record3DHeader.depthHeight * sizeof(float);
-            if ( depthImageBuffer_.size() != decompressedDepthDataSize )
-            {
-                depthImageBuffer_.resize(decompressedDepthDataSize);
+#if DEBUG
+                fprintf( stderr, "JPEG decode error!\n" );
+#endif
+                break;
             }
 
-            DecompressBuffer(rawMessageBuffer.data() + offset, currSize, depthImageBuffer_);
-            offset += currSize;
-
-            // 3.5 Read and decompress the confidence frame corresponding to the depth frame
-            currSize = record3DHeader.confidenceMapSize;
-            // Resize the decompressed confidence image buffer
-            size_t decompressedConfidenceDataSize = record3DHeader.confidenceWidth * record3DHeader.confidenceHeight * sizeof(uint8_t);
-            if ( confidenceImageBuffer_.size() != decompressedConfidenceDataSize )
+            // Lock the frame mutex for all member-buffer writes.
             {
-                confidenceImageBuffer_.resize(decompressedConfidenceDataSize);
-            }
+                std::lock_guard<std::mutex> frameGuard{ frameMutex_ };
 
-            DecompressBuffer(rawMessageBuffer.data() + offset, currSize, confidenceImageBuffer_);
-            offset += currSize;
+                currentDeviceType_ = (DeviceType)record3DHeader.deviceType;
 
-            // 3.6 Read the misc buffer
-            if ( record3DHeader.miscSize > 0 )
-            {
-                currSize = record3DHeader.miscSize;
-
-                miscBuffer_.resize( currSize );
-                memcpy(miscBuffer_.data(), rawMessageBuffer.data() + offset, currSize );
-
+                // 3.3 Read intrinsic matrix coefficients
+                currSize = sizeof( IntrinsicMatrixCoeffs );
+                memcpy((void*) &rgbIntrinsicMatrixCoeffs_, rawMessageBuffer.data() + offset, currSize );
                 offset += currSize;
-            }
 
-            if ( onNewFrame )
-            {
+                // 3.4 Read the camera pose data
+                currSize = sizeof( CameraPose );
+                memcpy( (void*) &cameraPose_, rawMessageBuffer.data() + offset, currSize );
+                offset += currSize;
+
+                // 3.5 Copy the decoded RGB frame into the member buffer
+                currSize = record3DHeader.rgbSize;
+                size_t decompressedRGBDataSize = loadedWidth * loadedHeight * loadedChannels * sizeof(uint8_t);
+                if ( RGBImageBuffer_.size() != decompressedRGBDataSize )
+                {
+                    RGBImageBuffer_.resize(decompressedRGBDataSize);
+                }
+                memcpy( RGBImageBuffer_.data(), rgbPixels, decompressedRGBDataSize);
+                offset += currSize;
+
+                // 3.6 Read and decompress the depth frame
+                currSize = record3DHeader.depthSize;
+                size_t decompressedDepthDataSize = record3DHeader.depthWidth * record3DHeader.depthHeight * sizeof(float);
+                if ( depthImageBuffer_.size() != decompressedDepthDataSize )
+                {
+                    depthImageBuffer_.resize(decompressedDepthDataSize);
+                }
+
+                DecompressBuffer(rawMessageBuffer.data() + offset, currSize, depthImageBuffer_);
+                offset += currSize;
+
+                // 3.7 Read and decompress the confidence frame corresponding to the depth frame
+                currSize = record3DHeader.confidenceMapSize;
+                size_t decompressedConfidenceDataSize = record3DHeader.confidenceWidth * record3DHeader.confidenceHeight * sizeof(uint8_t);
+                if ( confidenceImageBuffer_.size() != decompressedConfidenceDataSize )
+                {
+                    confidenceImageBuffer_.resize(decompressedConfidenceDataSize);
+                }
+
+                DecompressBuffer(rawMessageBuffer.data() + offset, currSize, confidenceImageBuffer_);
+                offset += currSize;
+
+                // 3.8 Read the misc buffer
+                if ( record3DHeader.miscSize > 0 )
+                {
+                    currSize = record3DHeader.miscSize;
+
+                    miscBuffer_.resize( currSize );
+                    memcpy(miscBuffer_.data(), rawMessageBuffer.data() + offset, currSize );
+
+                    offset += currSize;
+                }
+
                 currentFrameRGBWidth_ = record3DHeader.rgbWidth;
                 currentFrameRGBHeight_ = record3DHeader.rgbHeight;
 
@@ -220,7 +292,12 @@ namespace Record3D
 
                 currentFrameConfidenceWidth_ = record3DHeader.confidenceWidth;
                 currentFrameConfidenceHeight_ = record3DHeader.confidenceHeight;
+            }
 
+            // Fire callback OUTSIDE frameMutex_ to avoid GIL+frameMutex_ lock
+            // ordering deadlock with Python accessor methods.
+            if ( onNewFrame )
+            {
 #ifdef PYTHON_BINDINGS_BUILD
                 onNewFrame( );
 #else
@@ -239,9 +316,12 @@ namespace Record3D
                             cameraPose_ );
 #endif
             }
+            stbi_image_free( rgbPixels );
         }
 
-        Disconnect();
+        // Signal that the connection has ended and perform one-shot cleanup.
+        connectionEstablished_.store( false );
+        PerformDisconnectCleanup();
     }
 
     uint8_t* Record3DStream::DecompressBuffer(const uint8_t* $compressedBuffer, size_t $compressedBufferSize, std::vector<uint8_t> &$destinationBuffer)
@@ -265,16 +345,22 @@ namespace Record3D
     uint32_t Record3DStream::ReceiveWholeBuffer(int $socketHandle, uint8_t* $outputBuffer, uint32_t $numBytesToRead)
     {
         uint32_t numTotalReceivedBytes = 0;
-        while ( numTotalReceivedBytes < $numBytesToRead )
+        while ( numTotalReceivedBytes < $numBytesToRead && connectionEstablished_.load() )
         {
             uint32_t numRestBytes = $numBytesToRead - numTotalReceivedBytes;
             uint32_t numActuallyReceivedBytes = 0;
-            if ( 0 != usbmuxd_recv( $socketHandle, (char*) ($outputBuffer + numTotalReceivedBytes), numRestBytes,
-                                    &numActuallyReceivedBytes ))
+            int recvResult = usbmuxd_recv( $socketHandle, (char*) ($outputBuffer + numTotalReceivedBytes), numRestBytes,
+                                           &numActuallyReceivedBytes );
+            if ( recvResult != 0 )
             {
 #if DEBUG
                 fprintf( stderr, "ERROR WHILE RECEIVING DATA!\n" );
 #endif
+                return numTotalReceivedBytes;
+            }
+            if ( numActuallyReceivedBytes == 0 )
+            {
+                // Timeout or EOF — stop to avoid spinning forever.
                 return numTotalReceivedBytes;
             }
             numTotalReceivedBytes += numActuallyReceivedBytes;

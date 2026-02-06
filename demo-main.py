@@ -77,6 +77,7 @@ class DemoApp:
 
 
 if __name__ == '__main__':
+    print('Record3D library version: {}'.format(Record3DStream.get_version()))
     app = DemoApp()
     app.connect_to_device(dev_idx=0)
     app.start_processing_stream()

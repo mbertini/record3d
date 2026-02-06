@@ -44,6 +44,12 @@ namespace Record3D
         static std::vector<DeviceInfo> GetConnectedDevices();
 
         /**
+         * Returns the version string of the Record3D library.
+         * @return version string (e.g. "1.4.1").
+         */
+        static std::string GetVersion();
+
+        /**
          * Connect to a selected iDevice via USB. The `onNewFrame()` callback will be called upon receiving
          * a new RGBD frame from the iDevice.
          *
@@ -73,6 +79,12 @@ namespace Record3D
          * Runloop that reads from the connected iDevice and processes received data.
          */
         void StreamProcessingRunloop();
+
+        /**
+         * Performs one-shot disconnect cleanup: closes the socket and fires the onStreamStopped callback.
+         * Safe to call from multiple threads — only the first call has effect.
+         */
+        void PerformDisconnectCleanup();
 
         /**
          * Decompresses incoming compressed depth frame into $destinationBuffer of known size.
@@ -158,6 +170,7 @@ namespace Record3D
          */
         py::array_t<float> GetCurrentDepthFrame()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             size_t currentFrameWidth = currentFrameDepthWidth_;
             size_t currentFrameHeight = currentFrameDepthHeight_;
 
@@ -178,6 +191,7 @@ namespace Record3D
          */
         py::array_t<uint8_t> GetCurrentConfidenceFrame()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             size_t currentFrameWidth = currentFrameConfidenceWidth_;
             size_t currentFrameHeight = currentFrameConfidenceHeight_;
 
@@ -198,6 +212,7 @@ namespace Record3D
          */
         py::array_t<uint8_t> GetCurrentMiscData()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             size_t bufferSize  = miscBuffer_.size();
             auto result        = py::array_t<uint8_t>( bufferSize );
             auto result_buffer = result.request();
@@ -215,6 +230,7 @@ namespace Record3D
          */
         py::array_t<uint8_t> GetCurrentRGBFrame()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             size_t currentFrameWidth = currentFrameRGBWidth_;
             size_t currentFrameHeight = currentFrameRGBHeight_;
 
@@ -236,6 +252,7 @@ namespace Record3D
          */
         IntrinsicMatrixCoeffs GetCurrentIntrinsicMatrix()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             return rgbIntrinsicMatrixCoeffs_;
         }
 
@@ -246,6 +263,7 @@ namespace Record3D
          */
         CameraPose GetCurrentCameraPose()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             return cameraPose_;
         }
 
@@ -256,6 +274,7 @@ namespace Record3D
          */
         uint32_t GetCurrentDeviceType()
         {
+            std::lock_guard<std::mutex> guard{ frameMutex_ };
             return (uint32_t) currentDeviceType_;
         }
 #endif
@@ -278,6 +297,8 @@ namespace Record3D
         std::thread runloopThread_; /** Background thread on which the main runloop is running. */
 
         std::mutex apiCallsMutex_; /** Mutex used for guarding API calls. */
+        mutable std::mutex frameMutex_; /** Mutex used for guarding frame buffer access. */
+        std::atomic<bool> disconnectCleanupDone_{ true }; /** Ensures disconnect cleanup runs at most once per connection. */
 
         std::vector<uint8_t> depthImageBuffer_{}; /** Holds the most recent Depth buffer. */
         std::vector<uint8_t> RGBImageBuffer_{}; /** Holds the most recent RGB buffer. */
